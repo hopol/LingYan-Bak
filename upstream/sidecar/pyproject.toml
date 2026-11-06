@@ -1,0 +1,63 @@
+[project]
+name = "tender-agent-sidecar"
+version = "0.1.0"
+description = "灵燕智能 local-first sidecar: FastAPI + DeepAgents + SQLite"
+license = "MIT"
+requires-python = ">=3.12"
+dependencies = [
+    "deepagents==0.7.7",
+    "langchain-openai",
+    "langgraph",
+    "langgraph-checkpoint-sqlite",
+    "python-docx",
+    "fastapi",
+    "uvicorn",
+    "pydantic",
+    "python-multipart",
+    "sse-starlette",
+    "langchain-deepseek>=1.1.0",
+    "httpx",
+    "trafilatura>=2.0",
+    "jieba>=0.42.1",
+    # vlm.py / api/settings.py 直用 openai SDK（ChatCompletions + 连通性测试），
+    # 原先靠 langchain-openai 的传递依赖裸用，显式声明转正（版本=uv.lock 既有解析）
+    "openai==3.3.1",
+    "tenacity>=9",
+    "pypdfium2>=4.30,<5",
+    "pillow>=12.3.0",
+]
+
+# 国内网络必须（pypi.org 直连会 TLS 超时）
+[[tool.uv.index]]
+url = "https://pypi.tuna.tsinghua.edu.cn/simple"
+default = true
+
+[dependency-groups]
+dev = [
+    "pytest",
+    "ruff",
+    # pydantic 模型 → TS interface 生成（CLI 命令名 pydantic2ts；契约单一事实源用）
+    "pydantic-to-typescript",
+    "reportlab>=5.0.1",
+]
+
+# cryptography 是传递依赖（deepagents → langchain-google-genai → google-auth）。
+# 49.0.0 起 macOS 轮子只发 arm64，x86_64-apple-darwin（mac universal 包的 Intel 半边）
+# 会被迫源码编译（maturin + x86_64 OpenSSL，Rosetta Homebrew 一堆前置）；48.x 仍是
+# universal2 轮子、纯下载。等上游恢复 x86_64 轮子或放弃 universal 时可解除。
+[tool.uv]
+constraint-dependencies = ["cryptography<49"]
+
+[tool.ruff]
+target-version = "py312"
+# 不启用 formatter（待工作区干净后再一次性全量格式化，避免大 diff 混入功能改动）
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I"]
+
+[tool.pytest.ini_options]
+addopts = "-m 'not e2e'"
+markers = [
+    "e2e: 端到端冒烟（spawn 真实 sidecar + LLM 一轮；uv run pytest -m e2e）",
+]

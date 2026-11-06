@@ -1,0 +1,83 @@
+/* prompt-kit 移植组件（ai/*）所需的 keyframes 与工具类。 */
+/* keyframes 名与 prompt-kit globals.css 保持一致，供 Loader / TextShimmer 的 inline animation 引用。 */
+
+@keyframes shimmer {
+  0% { background-position: 200% center; }
+  100% { background-position: -200% center; }
+}
+
+/* 彗尾式渐隐（亮→暗 15%）：跳变发生在暗处，12 根辐条读起来是平滑旋转；
+   不可用 0→1（亮→全透明硬切），会一顿一顿（2026-08-29 实测反馈） */
+@keyframes spinner-fade {
+  0% { opacity: 1; }
+  100% { opacity: 0.15; }
+}
+
+/* 轮盘整体连续旋转：纯透明度错峰的亮头只能 30°/步离散跳（经典 iOS spinner 的
+   原理性限制，与帧率无关），叠加同周期同步旋转后亮头连续、彗尾形态不变 */
+@keyframes spinner-rotate {
+  to { transform: rotate(360deg); }
+}
+
+@keyframes thin-pulse {
+  0%, 100% { transform: scale(0.95); opacity: 0.8; }
+  50% { transform: scale(1.05); opacity: 0.4; }
+}
+
+@keyframes pulse-dot {
+  0%, 100% { transform: scale(1); opacity: 0.8; }
+  50% { transform: scale(1.5); opacity: 1; }
+}
+
+@keyframes bounce-dots {
+  0%, 100% { transform: scale(0.8); opacity: 0.5; }
+  50% { transform: scale(1.2); opacity: 1; }
+}
+
+@keyframes typing {
+  0%, 100% { transform: translateY(0); opacity: 0.5; }
+  50% { transform: translateY(-2px); opacity: 1; }
+}
+
+@keyframes wave {
+  0%, 100% { transform: scaleY(1); }
+  50% { transform: scaleY(0.6); }
+}
+
+@keyframes wave-bars {
+  0%, 100% { transform: scaleY(1); opacity: 0.5; }
+  50% { transform: scaleY(0.6); opacity: 1; }
+}
+
+@keyframes blink {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0; }
+}
+
+@keyframes text-blink {
+  0%, 100% { color: var(--Color-brand-primary); }
+  50% { color: var(--Color-text-secondary); }
+}
+
+@keyframes loading-dots {
+  0%, 100% { opacity: 0; }
+  50% { opacity: 1; }
+}
+
+/* TextShimmer：渐变位移文字（bg-clip-text + shimmer 动画）。
+   --shimmer-base 按模式取灰阶（不是新色值，只是 token 映射）：浅色底用 tertiary——
+   官方 muted-foreground 是「比正文浅一档」的灰，此前错映射到偏深的 secondary，
+   深色高亮带扫过时对比不足，动画肉眼不可见（2026-08-30 用户反馈）；
+   暗色高亮带是亮色，底保持 secondary 与官方 dark（#a1a1a1 底）等价。 */
+.text-shimmer {
+  --shimmer-base: var(--Color-text-tertiary);
+  background-size: 200% auto;
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  animation: shimmer 2.5s linear infinite;
+}
+
+[data-theme='dark'] .text-shimmer {
+  --shimmer-base: var(--Color-text-secondary);
+}

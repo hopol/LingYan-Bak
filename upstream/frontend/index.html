@@ -1,0 +1,17 @@
+<!doctype html>
+<html lang="zh-CN">
+  <!-- v1: force full-reload to clear stale SSE connections from pre-fix pages -->
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <!-- 字体 preload：font-display: swap 的字体若在 CSS/JS 之后才被发现，晚到的
+         字体会让全屏文字同时重折行（一次大 CLS）。preload 让它与首屏资源并行下载 -->
+    <link rel="preload" href="/fonts/InterVariable.woff2" as="font" type="font/woff2" crossorigin />
+    <title>灵燕智能</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

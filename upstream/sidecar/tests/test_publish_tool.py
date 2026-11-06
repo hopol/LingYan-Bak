@@ -1,0 +1,155 @@
+"""LLM 发布工具：任务 _meta/staging/ 草稿 containment、runctx 来源、合法草稿发布。"""
+
+import json
+
+import pytest
+
+from app import artifact_store, db, runctx
+from app.tools.publish import publish_artifact as publish_tool
+from tests.util import init_env
+
+KEY = "tender.directory/tender-response-docs@1"
+
+
+@pytest.fixture
+def env(tmp_path, monkeypatch):
+    task, conv = init_env(tmp_path, monkeypatch)
+    artifact_store.staging_dir(task["id"]).mkdir(parents=True, exist_ok=True)
+    return {"root": tmp_path, "task": task, "conv": conv}
+
+
+def _drafts_root(env):
+    return artifact_store.staging_dir(env["task"]["id"])
+
+
+def _draft(env, name="toc.json", obj=None):
+    p = _drafts_root(env) / name
+    p.write_text(
+        json.dumps(obj or {"response_documents": [{"name": "整册"}]}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    return p
+
+
+def test_publish_tool_happy_path_records_runctx(env):
+    _draft(env)
+    runctx.set_run(env["conv"]["id"], "r_abc", env["task"]["id"])
+    try:
+        out = publish_tool.invoke({"contract": KEY, "draft_path": "toc.json"})
+    finally:
+        runctx.clear_run()
+
+    assert out.startswith("[发布成功]")
+    row = db.list_artifact_index()[0]
+    assert row["last_thread_id"] == env["conv"]["id"]
+    assert row["last_run_id"] == "r_abc"
+    assert row["task_id"] == env["task"]["id"]
+    manifest = artifact_store.read_meta(row["artifact_id"], row)
+    assert manifest["source"] == {"skill": "direct", "thread_id": env["conv"]["id"], "run_id": "r_abc"}
+
+
+def test_publish_tool_accepts_task_prefixed_draft_path(env):
+    """模型按任务目录前缀给路径（如 <task>/_meta/staging/x.json）与裸文件名都能解析。"""
+    _draft(env, name="toc2.json")
+    runctx.set_run(env["conv"]["id"], "r_abc", env["task"]["id"])
+    try:
+        prefixed = f"{env['task']['id']}/_meta/staging/toc2.json"
+        assert publish_tool.invoke({"contract": KEY, "draft_path": prefixed}).startswith("[发布成功]")
+    finally:
+        runctx.clear_run()
+
+
+def test_publish_tool_rejects_draft_outside(env):
+    outside = env["root"] / "evil.json"
+    outside.write_text("{}", encoding="utf-8")
+    runctx.set_run(env["conv"]["id"], "r_abc", env["task"]["id"])
+    try:
+        out = publish_tool.invoke({"contract": KEY, "draft_path": str(outside)})
+        assert out.startswith("[发布失败]")
+        assert "越界" in out
+        assert db.list_artifact_index() == []
+
+        # 相对路径逃逸（../）同样拒绝
+        out = publish_tool.invoke({"contract": KEY, "draft_path": "../evil.json"})
+        assert out.startswith("[发布失败]")
+    finally:
+        runctx.clear_run()
+
+
+def test_publish_tool_rejects_invalid_json_and_schema(env):
+    p = _drafts_root(env) / "bad.json"
+    p.write_text("not json", encoding="utf-8")
+    runctx.set_run(env["conv"]["id"], "r_abc", env["task"]["id"])
+    try:
+        assert "不是合法 JSON" in publish_tool.invoke({"contract": KEY, "draft_path": "bad.json"})
+
+        _draft(env, name="wrong.json", obj={"foo": 1})
+        out = publish_tool.invoke({"contract": KEY, "draft_path": "wrong.json"})
+        assert "不符合契约" in out
+        assert db.list_artifact_index() == []
+    finally:
+        runctx.clear_run()
+
+
+def test_publish_tool_requires_task_context(env):
+    """§16：草稿区在任务目录下，无任务上下文（不在 run 中）直接失败。"""
+    _draft(env)
+    out = publish_tool.invoke({"contract": KEY, "draft_path": "toc.json"})
+    assert out.startswith("[发布失败]")
+    assert "任务上下文" in out
+    assert db.list_artifact_index() == []
+
+
+def test_publish_tool_identical_content_skips_republish(env):
+    """内容未变短路（2026-09-12）：同内容重发布 → [发布完成] 未重复发布，seq 不动；
+    草稿照常消费（防「两个产物」以 JSON 残骸复活）。"""
+    runctx.set_run(env["conv"]["id"], "r_same", env["task"]["id"])
+    try:
+        _draft(env)
+        assert publish_tool.invoke({"contract": KEY, "draft_path": "toc.json"}).startswith("[发布成功]")
+        _draft(env)  # 首次发布已消费草稿，重建同内容草稿
+        out = publish_tool.invoke({"contract": KEY, "draft_path": "toc.json"})
+        assert out.startswith("[发布完成]")
+        assert "未重复发布" in out
+        assert not (_drafts_root(env) / "toc.json").exists()
+        assert db.list_artifact_index()[0]["content_seq"] == 1
+    finally:
+        runctx.clear_run()
+
+
+def test_publish_tool_rejects_file_type_contract(env):
+    """文件型契约（tender.volume=docx 本体）不能经 JSON 草稿路径发布——会造出
+    没有本体文件的残包（列表可见、/file 端点 410）；整本由合册工具机械发布。"""
+    _draft(env, name="vol.json", obj={"filename": "整本-x.docx"})
+    runctx.set_run(env["conv"]["id"], "r_vol", env["task"]["id"])
+    try:
+        out = publish_tool.invoke(
+            {"contract": "tender.volume/tender-volume-docx@1", "draft_path": "vol.json"}
+        )
+        assert out.startswith("[发布失败]")
+        assert "文件型产物" in out
+        assert db.list_artifact_index() == []
+        assert (_drafts_root(env) / "vol.json").exists()  # 发布未成功，草稿不消费
+    finally:
+        runctx.clear_run()
+
+
+def test_publish_tool_via_guarded_backend_writes_staging(env):
+    """回归网（2026-08-31 review blocker）：草稿必须能经 GuardedBackend 写入
+    _meta/staging/——fs_guard 曾把 _meta 段级拦死，而本工具指示模型把草稿写到
+    那里，通用发布链路在真实 run 里不可用（旧测试用 pathlib 直写绕过了守卫，
+    故全绿漏网）。"""
+    from app import config as cfg
+    from app.fs_guard import GuardedBackend
+
+    be = GuardedBackend(root_dir=str(cfg.workspace_dir()))
+    r = be.write(
+        f"{env['task']['id']}/_meta/staging/guarded.json",
+        json.dumps({"response_documents": [{"name": "整册"}]}, ensure_ascii=False),
+    )
+    assert not r.error, f"守卫误拦发布草稿区：{r.error}"
+    runctx.set_run(env["conv"]["id"], "r_guard", env["task"]["id"])
+    try:
+        assert publish_tool.invoke({"contract": KEY, "draft_path": "guarded.json"}).startswith("[发布成功]")
+    finally:
+        runctx.clear_run()
