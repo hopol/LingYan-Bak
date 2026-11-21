@@ -32,7 +32,8 @@ docx 翻译成文本世界（读视图/编号寻址），写入全由程序机�
   覆盖正文与表格单元格段落）
 - docx_assemble_volume：整本合册——按投标目录树序把各节 docx 合并成每册
   一个整本文件（容器节点发章标题——按树序自动编号（第X章/1.1，格式取目录
-  产物 numbering 字段）、一级章前分页、页脚页码；模板填充类叶子
+  产物 numbering 字段）、一级章前分页、正文页脚页码（封面/目录不编，正文自
+  1 起分节重起）；模板填充类叶子
   产出节文件即按树序并入、未产出按附件对待不占整本位；「目录」节点机械
   生成目录页（Word 目录域+缓存清单，2026-09-14 批）且目录前前置页不占章号、
   空容器章标题抑制；**整本=交付态**：
@@ -69,6 +70,7 @@ from pathlib import Path
 from xml.sax.saxutils import escape
 
 from docx import Document
+from docx.enum.section import WD_SECTION
 from docx.enum.style import WD_STYLE_TYPE
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.oxml import OxmlElement, parse_xml
@@ -963,6 +965,47 @@ def _new_document() -> Document:
     if tpl.is_file():
         return _blank_from(tpl)
     return Document()
+
+
+# CT_SectPr 元素序中 pgNumType 之后的成员（ECMA-376 顺序；手工插 pgNumType 用——
+# python-docx 未建模该元素，无 API）
+_PGNUMTYPE_SUCCESSORS = (
+    "w:cols", "w:formProt", "w:vAlign", "w:noEndnote", "w:titlePg",
+    "w:textDirection", "w:bidi", "w:rtlGutter", "w:docGrid",
+    "w:printerSettings", "w:sectPrChange",
+)
+
+
+def _start_body_paging_section(doc: Document) -> None:
+    """正文分节（2026-11-20 拍板：封面/前置/目录不编页码，正文第一页=第 1 页）。
+
+    在文档当前末尾插「下一页」分节符：前置整节摘净页眉页脚引用（封面溢出到
+    第 2 页也不带页码——治「首页不同」只豁免字面第一页的局限），正文节重挂
+    版式 default 页眉/页脚并 pgNumType 自 1 重起。python-docx add_section 的
+    缺省恰与目标相反——克隆留在前节（带页脚引用）、新末节被剥引用靠继承，
+    而继承链上前节一旦摘净两节页脚皆空，故显式挪引用：分节前存 default 类
+    引用，分节后前置节全摘、正文节重挂（first/even 变体一并不挂——第一页
+    语义已由分节承担，正文首页不套用版式的首页变体页脚）。"""
+    default_refs = [
+        deepcopy(ref)
+        for ref in doc.sections[-1]._sectPr.xpath("w:headerReference|w:footerReference")
+        if ref.get(qn("w:type")) == "default"
+    ]
+    doc.add_section(WD_SECTION.NEW_PAGE)
+    front_sect = doc.sections[0]._sectPr  # 克隆节=前置节：页眉页脚全摘、页码不编
+    for ref in front_sect.xpath("w:headerReference|w:footerReference"):
+        front_sect.remove(ref)
+    body_sect = doc.sections[-1]._sectPr  # 哨兵节=正文节（引用已被库剥净）：重挂
+    for i, ref in enumerate(default_refs):
+        body_sect.insert(i, ref)  # headerReference/footerReference 居 CT_SectPr 序首
+    pgnum = parse_xml(f'<w:pgNumType {nsdecls("w")} w:start="1"/>')
+    for tag in _PGNUMTYPE_SUCCESSORS:
+        succ = body_sect.find(qn(tag))
+        if succ is not None:
+            succ.addprevious(pgnum)
+            break
+    else:
+        body_sect.append(pgnum)
 
 
 def _body_style(doc: Document):
@@ -2006,6 +2049,27 @@ def _place_after_anchor(doc: Document, p_el, after: str, label: str) -> tuple[st
     return None, "节末"
 
 
+def _exif_normalized(data: bytes, suffix: str) -> bytes:
+    """EXIF 方向归一（2026-11-19）：手机竖拍证件照常带 Orientation 5-8，python-docx
+    原字节直插会横躺进文档；Pillow exif_transpose 转正后按原格式回写。
+    无 EXIF/无方向标签/Pillow 缺失时原样返回（PDF 渲染 PNG 无此问题）。"""
+    if suffix not in (".jpg", ".jpeg"):
+        return data
+    try:
+        from PIL import Image, ImageOps
+
+        im = Image.open(BytesIO(data))
+        exif = im.getexif() if hasattr(im, "getexif") else None
+        if not exif or exif.get(274) in (None, 1):  # 274 = Orientation
+            return data
+        fixed = ImageOps.exif_transpose(im)
+        buf = BytesIO()
+        fixed.save(buf, format="JPEG")
+        return buf.getvalue()
+    except Exception:
+        return data
+
+
 @tool
 @_tool_guard("插图")
 def docx_image_insert(dest: str, image: str, after: str = "", page: int = 1) -> str:
@@ -2074,17 +2138,18 @@ def docx_image_insert(dest: str, image: str, after: str = "", page: int = 1) -> 
             tmp_png.unlink(missing_ok=True)
         src_label = f"{image} 第 {page} 页（按页渲染）"
     elif suffix in (".png", ".jpg", ".jpeg", ".bmp", ".gif"):
-        data = src.read_bytes()
+        data = _exif_normalized(src.read_bytes(), suffix)
         src_label = image
     elif suffix == ".webp":
         # python-docx 不认 webp（docx.image 只有 png/jpg/bmp/gif/tiff 解析器），
         # Pillow 解码后转 PNG 再插——知识库上传白名单收 webp（IMAGE_EXTS），此处
         # 不接会把「收得进、插不进」的矛盾留给用户（2026-09-14 复核批）。
         # 坏文件（半截/伪造后缀）按人话报错，不裸抛类型名（_tool_guard 兜底是英文）
-        from PIL import Image
+        from PIL import Image, ImageOps
 
         try:
             with Image.open(src) as im:
+                im = ImageOps.exif_transpose(im)
                 buf = BytesIO()
                 im.convert("RGBA").save(buf, format="PNG")
         except Exception:
@@ -2321,13 +2386,15 @@ def _grid_layered(layers: list[dict]) -> tuple[list[list[dict]], list[float]]:
     return grid, [0.18, 0.205, 0.205, 0.205, 0.205]
 
 
-def _grid_gantt(tasks: list[dict], weeks: int, milestones: list[dict]):
-    """甘特网格：任务行×周列，区间格填色即时间条（空文本+底纹），里程碑行 ◆。
-    周列窄格是形态本身——列数上限不适用，由 weeks ≤36 上限管横向溢出。"""
+def _grid_gantt(tasks: list[dict], weeks: int, milestones: list[dict], unit: str = "周"):
+    """甘特网格：任务行×周期列（unit 缺省 周，可 日/月 等——表头缩写跟随单位），
+    区间格填色即时间条（空文本+底纹），里程碑行 ◆。
+    周期窄格是形态本身——列数上限不适用，由总期数 ≤36 上限管横向溢出。"""
+    abbrev = {"周": "W", "日": "D", "天": "D", "月": "M", "季": "Q"}.get(unit, unit[:1].upper() or "W")
     head_cell = {"bold": True, "fill": _DIAG_HEAD_FILL, "center": True}
     grid: list[list[dict]] = [
         [{"text": "任务", **head_cell}]
-        + [{"text": f"W{w}", **head_cell} for w in range(1, weeks + 1)]
+        + [{"text": f"{abbrev}{w}", **head_cell} for w in range(1, weeks + 1)]
     ]
     for t in tasks:
         row = [{"text": t["name"]}]
@@ -2414,15 +2481,17 @@ def _parse_diagram_spec(kind: str, spec: str) -> tuple[dict | list | None, str |
         return norm, None
 
     if kind == "gantt":
+        unit = _cell_str(data.get("unit")).strip() or "周"
         tasks = data.get("tasks")
         if not isinstance(tasks, list) or not tasks:
             return None, (
-                "gantt 须带 tasks：[{\"name\":\"需求调研\",\"start\":1,\"end\":4}, …]（周号从 1 起）"
+                "gantt 须带 tasks：[{\"name\":\"需求调研\",\"start\":1,\"end\":4}, …]"
+                "（序号从 1 起，单位随 unit——默认 周，可 日/月 等）"
             )
         try:
             weeks = int(data.get("weeks") or 0)
         except (TypeError, ValueError):
-            return None, "weeks 须为整数（周数，可省略——按任务最晚结束周推定）"
+            return None, "weeks 须为整数（总期数，可省略——按任务最晚结束推定）"
         norm_tasks: list[dict] = []
         for i, t in enumerate(tasks, 1):
             if not isinstance(t, dict):
@@ -2433,15 +2502,15 @@ def _parse_diagram_spec(kind: str, spec: str) -> tuple[dict | list | None, str |
             try:
                 start, end = int(t.get("start")), int(t.get("end"))
             except (TypeError, ValueError):
-                return None, f"tasks 第 {i} 项 start/end 须为整数（周号从 1 起）"
+                return None, f"tasks 第 {i} 项 start/end 须为整数（序号从 1 起，单位随 unit）"
             if start < 1 or end < start:
                 return None, f"tasks 第 {i} 项区间非法（须 1 ≤ start ≤ end）"
             norm_tasks.append({"name": name, "start": start, "end": end})
             weeks = max(weeks, end)
         if weeks > 36:
             return None, (
-                f"总周数 {weeks} 超上限（≤36）——长周期请以月为单位聚合"
-                '（如 {"name":"需求调研","start":1,"end":2} 的 start/end 按月计）'
+                f"总期数 {weeks} 超上限（≤36）——长周期请换大单位聚合"
+                '（如 unit:"月" 后 start/end/week 按月计，表头随之显示 M1/M2/…）'
             )
         milestones_raw = data.get("milestones") or []
         if not isinstance(milestones_raw, list):
@@ -2456,11 +2525,11 @@ def _parse_diagram_spec(kind: str, spec: str) -> tuple[dict | list | None, str |
             try:
                 week = int(m.get("week"))
             except (TypeError, ValueError):
-                return None, f"milestones 第 {i} 项 week 须为整数"
+                return None, f"milestones 第 {i} 项 week 须为整数（序号，单位随 unit）"
             if not 1 <= week <= weeks:
-                return None, f"milestones 第 {i} 项 week={week} 超出总周数 {weeks}"
+                return None, f"milestones 第 {i} 项 week={week} 超出总期数 {weeks}"
             norm_ms.append({"week": week, "label": label})
-        return {"tasks": norm_tasks, "weeks": weeks, "milestones": norm_ms}, None
+        return {"tasks": norm_tasks, "weeks": weeks, "milestones": norm_ms, "unit": unit}, None
 
     # kind == "radial"（调用方已把关 kind 取值）
     center = _cell_str(data.get("center")).strip()
@@ -2635,7 +2704,9 @@ def docx_diagram_insert(dest: str, kind: str, spec: str, after: str = "", captio
             tbl = _grid_table(doc, grid, ratios)
             stat = f"{len(parsed)} 层"
         elif kind == "gantt":
-            grid, ratios = _grid_gantt(parsed["tasks"], parsed["weeks"], parsed["milestones"])
+            grid, ratios = _grid_gantt(
+                parsed["tasks"], parsed["weeks"], parsed["milestones"], parsed.get("unit", "周")
+            )
             tbl = _grid_table(doc, grid, ratios)
             stat = f"{len(parsed['tasks'])} 项任务×{parsed['weeks']} 周"
         else:
@@ -3030,10 +3101,16 @@ def _insert_mechanical_toc(out: Document, anchor, entries: list[tuple[str, str, 
         for el in reversed(els):
             anchor.addnext(el)
     else:
-        sect = out.element.body.find(qn("w:sectPr"))
+        # 无锚=目录节点居树首（无封面无前置）：插到文档最前。不能按 body 末级
+        # sectPr 插——分节后那属正文节，会把目录页落到正文节里（带页码且挤掉
+        # 正文首页）；分节符段落此刻即首个内容元素，addprevious 恰落在它之前
+        first = next(
+            (el for el in out.element.body.iterchildren() if el.tag != qn("w:sectPr")),
+            None,
+        )
         for el in els:
-            if sect is not None:
-                sect.addprevious(el)
+            if first is not None:
+                first.addprevious(el)
             else:
                 out.element.body.append(el)
     return len(entries)
@@ -3277,7 +3354,7 @@ def docx_assemble_volume() -> str:
 
     用途：全部节完成后调用，产出 work/body/整本-<册名>.docx。容器章由本工具发
     标题（层级随树深，Word 可自动生成目录）、叶子节内容元素级拷入（图片/表格
-    原样保留）、一级章前分页、页脚页码；模板填充类叶子（目录标非正文）**产出
+    原样保留）、一级章前分页、正文页脚页码（封面/目录不编，正文自 1 起）；模板填充类叶子（目录标非正文）**产出
     节文件即按树序并入**（拷原件填空的格式件本就是标书组成部分）、未产出的按
     附件对待不占整本位（返回行点名）。章节编号按树序自动生成（第一章/1.1；
     格式取目录产物的 numbering 字段，缺省第X章+1.1；封面不占序，目录产物里
@@ -3293,8 +3370,10 @@ def docx_assemble_volume() -> str:
     自动目录只剩章节骨架，视觉样式不变；「目录」节并入后与实收章节机械对账，
     不符（列了没有的/漏了实有的）点名提醒。
     树首节点为「封面」时（tender-outline 的结构约定）整本首页即封面页：跳过册名
-    大标题与封面节点自身标题、开「首页不同」（封面页不带页眉页脚，页码从封面
-    后一页起显示）。缺失的正文节文件逐个点名，不中断其余节。**整本是派生产物**：改内容
+    大标题与封面节点自身标题。**页码分节（2026-11-20 拍板）**：树含「封面」或
+    「目录」节点时正文自成一节——封面/前置/目录整节不带页眉页脚、页码不编，
+    正文节重挂版式页脚、页码自 1 重起（行业惯例：标书正文第一页=第 1 页）；
+    两者皆无的旧目录产物不分节，全册页码从首页编起。缺失的正文节文件逐个点名，不中断其余节。**整本是派生产物**：改内容
     回节文件层改（或让模型改）再重新调用本工具覆盖合册，直接手改整本会被下次
     合册覆盖。**合册成功即自动发布为整本标书产物**（每册一条；docx 内容未变不
     重复发布）。
@@ -3339,8 +3418,8 @@ def docx_assemble_volume() -> str:
         numberer = _HeadingNumberer(numberer_scheme)  # 各册从首章重起
         self_numbered: list[str] = []  # 节点名自带编号（合册再编号会双重，探测点名）
         # 封面=树首一级叶子且清洗后标题为「封面」（tender-outline 的结构约定）：
-        # 整本首页即封面页——跳过册名大标题（封面自带册名）与节点自身标题，
-        # 开「首页不同」让封面页不带页眉页脚；无封面时行为与旧版逐字节一致。
+        # 整本首页即封面页——跳过册名大标题（封面自带册名）与节点自身标题；
+        # 封面页不带页眉页脚由页码分节承担（见 front_end_idx），无封面时行为与旧版一致。
         has_cover = (
             bool(nodes)
             and nodes[0][0] == 1
@@ -3373,10 +3452,19 @@ def docx_assemble_volume() -> str:
                 "编制说明等前置页会占章号——如需前置区请在目录里加「目录」节点）"
             )
         empty_ids = _empty_containers(doc.get("directory") or [], wroot, vol_dir)
-        out = _new_document()  # 模板自带 A4 版面/页边距/页脚页码，无需再手拼
-        if has_cover:
-            out.sections[0].different_first_page_header_footer = True
+        # 页码分节锚（2026-11-20 拍板：封面/前置/目录不编页码，正文第一页=第1页）：
+        # 锚后首个节点发射前插分节符，其后全部内容落正文节（页码自 1 重起）；
+        # 无封面无目录的旧目录产物不分节（全册页码从首页编，行为与旧版一致）
+        if toc_node_idx is not None:
+            front_end_idx: int | None = toc_node_idx
+        elif has_cover:
+            front_end_idx = 0
         else:
+            front_end_idx = None
+        body_section_started = False
+        suppress_first_break = False  # 分节符已换页：正文首个一级章不再叠段前分页
+        out = _new_document()  # 模板自带 A4 版面/页边距/页脚页码，无需再手拼
+        if not has_cover:
             out.add_heading(vol, 0)
         merged = n_img = n_comment = n_cap = n_sub = 0
         cap_counters: dict = {}  # (表|图, 章) → 章内序——图注/表题全局重编号
@@ -3413,6 +3501,14 @@ def docx_assemble_volume() -> str:
                     toc_entries.append(("", f"{title}（另附）", depth))
                     continue  # 模板填充未产出：按附件对待（壳节漏建的兜底），不占整本位
                 # 已产出（拷原件+填空/附件壳节）：按树序并入整本，与正文叶子同路
+            if front_end_idx is not None and idx > front_end_idx and not body_section_started:
+                # 正文分节点：发射正文首个节点前插分节符——前置整节（封面/前置/
+                # 目录）至此封笔，其后标题与拷入内容全部落正文节。前置零内容
+                # （如封面缺节文件又无前置页）不分节——空前置节会多出一张空白页
+                body_section_started = True
+                if any(el.tag != qn("w:sectPr") for el in out.element.body.iterchildren()):
+                    _start_body_paging_section(out)
+                    suppress_first_break = True
             if has_cover and idx == 0:
                 # 封面节点不发「封面」标题行（节文件内容即整页），但占一级位：
                 # seen_chapter 置位让第一章拿到分页、封面独占首页；编号不占序
@@ -3428,9 +3524,12 @@ def docx_assemble_volume() -> str:
                     issued_titles.append(title)
                     toc_entries.append((prefix, title, depth))
                 if depth == 1:
-                    if seen_chapter:
+                    # 分节符已换页的正文首章不再叠段前分页（Word 对页首段落不重复
+                    # 分页，但渲染器可能双重换页出空白页）
+                    if seen_chapter and not suppress_first_break:
                         h.paragraph_format.page_break_before = True
                     seen_chapter = True
+                suppress_first_break = False  # 只豁免分节后的首个标题
             if is_container:
                 continue
             src_path = wroot / rel_src
@@ -3510,6 +3609,10 @@ def docx_assemble_volume() -> str:
                 )
             n_comment += _merge_missing_comments(src, out, copied)
             merged += 1
+        if has_cover and not body_section_started:
+            # 退化树（封面后零正文节点，无处插分节）：回落「首页不同」保封面页
+            # 不带页眉页脚——整节机制只在确有正文时分节
+            out.sections[0].different_first_page_header_footer = True
         if merged == 0:
             notes: list[str] = []
             if missing:
@@ -3552,6 +3655,8 @@ def docx_assemble_volume() -> str:
         # （publish_file_artifact 成功分支 note kind=artifact）——工作台整本行已隐藏，
         # 不再 note kind=file 防打开隐藏行；发布失败=不自动开，chips 仍是手动出口
         bits = f"{vol}：合并 {merged} 节 → work/{rel}"
+        if body_section_started:
+            bits += "（封面/目录不编页码，正文自第 1 页起编）"
         if n_img:
             bits += f"（含图片 {n_img} 张）"
         if n_comment:
